@@ -18,6 +18,10 @@ from datetime import time
 from sqlalchemy.orm import Session
 
 from app.core.errors import DomainError
+
+# Registra todos los modelos: al correr el script solo, sin esto SQLAlchemy no encuentra las clases
+# que las relaciones nombran como texto (por ejemplo DeliveryDriver desde Order).
+from app.db import base  # noqa: F401
 from app.db.seed import CATEGORIAS_DE_EJEMPLO, INGREDIENTES_DE_EJEMPLO, PRODUCTOS_DE_EJEMPLO
 from app.db.session import SessionLocal, transaction
 from app.models.menu import Category, Ingredient, Product
