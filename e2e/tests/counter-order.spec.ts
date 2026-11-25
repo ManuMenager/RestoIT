@@ -39,7 +39,7 @@ test.describe('Pedido presencial (mostrador)', () => {
     const card = orderCard(column(page, 'En preparación'), orderId);
     await expect(card).toContainText(nombre);
     await expect(card).toContainText('Mostrador');
-    await expect(card).toContainText(money(2 * 10200 + 3200));
+    await expect(card).toContainText(money(2 * 10200 + 6500));
 
     await card.getByRole('button', { name: `Ver detalle del pedido #${orderId}` }).click();
     const detalle = page.getByRole('dialog', { name: `Pedido #${orderId}` });

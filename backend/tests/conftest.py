@@ -16,6 +16,8 @@ _TEST_ENV = {
     "MERCADOPAGO_PUBLIC_KEY": "",
     "MERCADOPAGO_WEBHOOK_SECRET": "",
     "PUBLIC_URL": "",
+    # Los tests que corren el seed no cargan el historial de pedidos de ejemplo (tiene sus propios tests).
+    "SEED_PEDIDOS": "0",
 }
 for _key, _value in _TEST_ENV.items():
     os.environ.setdefault(_key, _value)

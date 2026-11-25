@@ -24,7 +24,7 @@ test.describe('Ciclo de vida de un pedido en el panel', () => {
     await expect(confirmado).toContainText(nombre);
     await expect(confirmado).toContainText('Web');
     await expect(confirmado).toContainText('Tocar timbre 2B');
-    await expect(confirmado).toContainText(money(19500));
+    await expect(confirmado).toContainText(money(20500));
     // Sin demora configurada (ni historial ni regla fija) no se informa ninguna.
     await expect(confirmado).not.toContainText('Estimado');
     await expect(confirmado.getByRole('button', { name: 'Rechazar' })).toHaveCount(0);
@@ -35,7 +35,7 @@ test.describe('Ciclo de vida de un pedido en el panel', () => {
     await confirmado.getByRole('button', { name: `Ver detalle del pedido #${order.id}` }).click();
     const detalle = page.getByRole('dialog', { name: `Pedido #${order.id}` });
     await expect(detalle.getByRole('row', { name: /Pizza Muzzarella/ })).toContainText(money(17000));
-    await expect(detalle.getByRole('row', { name: /Coca-Cola 500ml/ })).toContainText(money(2500));
+    await expect(detalle.getByRole('row', { name: /Coca-Cola 500ml/ })).toContainText(money(3500));
     await expect(detalle.getByText('Belgrano 95, Ramos Mejía')).toBeVisible();
     await expect(detalle.getByText('Pendiente de pago')).toBeVisible();
     await page.keyboard.press('Escape');
@@ -64,7 +64,7 @@ test.describe('Ciclo de vida de un pedido en el panel', () => {
     await goToSection(page, 'Historial');
     const fila = page.getByRole('row', { name: new RegExp(nombre) });
     await expect(fila).toContainText('Finalizado');
-    await expect(fila).toContainText(money(19500));
+    await expect(fila).toContainText(money(20500));
   });
 
   test('un pedido para retirar se marca listo y un pedido cancelado sale del tablero', async ({ page, request }) => {
