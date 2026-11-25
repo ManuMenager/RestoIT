@@ -1,6 +1,10 @@
 """Carga del menú de La Isla sobre una base con el menú de ejemplo del seed."""
 
+import os
+import subprocess
+import sys
 from datetime import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -146,3 +150,18 @@ def test_despues_de_cargarlo_el_seed_no_vuelve_a_traer_el_menu_de_ejemplo(db_ses
 
     assert db_session.query(Product).filter(Product.name == "Pizza Muzzarella").first() is None
     assert db_session.query(Category).filter(Category.name == "Postres").first() is None
+
+
+@pytest.mark.parametrize("modulo", ["app.db.menu_la_isla", "app.db.seed"])
+def test_el_script_suelto_conoce_todos_los_modelos(modulo):
+    # Se corren con "python -m" en el contenedor, sin la app ni los tests que registran todos los modelos.
+    codigo = f"import {modulo}; from sqlalchemy.orm import configure_mappers; configure_mappers()"
+    resultado = subprocess.run(
+        [sys.executable, "-c", codigo],
+        cwd=Path(__file__).resolve().parents[1],
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert resultado.returncode == 0, resultado.stderr
