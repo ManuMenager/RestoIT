@@ -41,7 +41,7 @@ def test_carga_los_productos_con_los_precios_de_la_carta(db_session, con_menu_de
     assert [(v.name, v.price) for v in muzza.variants] == [("Grande", 16000), ("Chica", 14000)]
     assert muzza.category.name == "Pizzas"
     assert muzza.description == "Salsa, muzzarella, orégano y aceitunas."
-    assert sorted(item.ingredient.name for item in muzza.recipe_items) == ["Aceitunas", "Muzzarella", "Orégano", "Salsa"]
+    assert sorted(item.ingredient.name for item in muzza.recipe_items) == ["Aceitunas", "Masa de pizza", "Muzzarella", "Orégano", "Salsa"]
 
     calabresa = _producto(db_session, "Calabresa")
     assert [(v.name, v.price) for v in calabresa.variants] == [("Grande", 19500), ("Chica", 17500)]
@@ -55,12 +55,14 @@ def test_carga_los_productos_con_los_precios_de_la_carta(db_session, con_menu_de
     assert _producto(db_session, "Pizzaneza La Isla").price_for("Pollo") == 41000
 
 
-def test_la_muzzarella_doble_lleva_doble_porcion_de_muzzarella(db_session, con_menu_de_ejemplo):
+def test_la_muzzarella_doble_lleva_el_doble_de_muzzarella(db_session, con_menu_de_ejemplo):
     _cargar(db_session)
 
-    receta = {item.ingredient.name: item.quantity for item in _producto(db_session, "Muzzarella Doble").recipe_items}
-    assert receta["Muzzarella"] == 2
-    assert db_session.query(Ingredient).filter(Ingredient.name == "Muzzarella").one().unit == "porciones"
+    simple = {item.ingredient.name: item.quantity for item in _producto(db_session, "Muzzarella").recipe_items}
+    doble = {item.ingredient.name: item.quantity for item in _producto(db_session, "Muzzarella Doble").recipe_items}
+    assert doble["Muzzarella"] == 2 * simple["Muzzarella"]
+    assert doble["Salsa"] == simple["Salsa"]
+    assert db_session.query(Ingredient).filter(Ingredient.name == "Muzzarella").one().unit == "gramos"
 
 
 def test_carga_todas_las_secciones_de_la_carta(db_session, con_menu_de_ejemplo):
@@ -78,15 +80,16 @@ def test_carga_todas_las_secciones_de_la_carta(db_session, con_menu_de_ejemplo):
         "Empanadas": 19,
         "Sándwiches": 9,
         "Papas Fritas": 2,
+        "Bebidas": 17,
     }
-    assert resumen["productos"] == 74
+    assert resumen["productos"] == 91
 
 
 def test_saca_el_menu_de_ejemplo_y_archiva_lo_que_tiene_pedidos(db_session, con_menu_de_ejemplo):
-    coca = _producto(db_session, "Coca-Cola 500ml")
+    flan = _producto(db_session, "Flan casero")
     pedido = Order(customer_name="Ana", status="Finalizado", source="web", delivery_method="retiro", shipping_address="x")
-    pedido.items = [OrderItem(product_id=coca.id, quantity=1, unit_price=2500)]
-    pedido.total_amount = 2500
+    pedido.items = [OrderItem(product_id=flan.id, quantity=1, unit_price=3500)]
+    pedido.total_amount = 3500
     db_session.add(pedido)
     db_session.commit()
 
@@ -94,9 +97,9 @@ def test_saca_el_menu_de_ejemplo_y_archiva_lo_que_tiene_pedidos(db_session, con_
 
     assert "Pizza Muzzarella" in resumen["sacados"]
     assert db_session.query(Product).filter(Product.name == "Pizza Muzzarella").first() is None
-    archivada = _producto(db_session, "Coca-Cola 500ml")
-    assert (archivada.is_archived, archivada.category_id) == (True, None)
-    assert {c.name for c in db_session.query(Category)}.isdisjoint({"Bebidas", "Postres"})
+    archivado = _producto(db_session, "Flan casero")
+    assert (archivado.is_archived, archivado.category_id) == (True, None)
+    assert "Postres" not in {c.name for c in db_session.query(Category)}
     assert db_session.query(Ingredient).filter(Ingredient.name == "Tomate en rodajas").first() is None
 
 
@@ -165,3 +168,44 @@ def test_el_script_suelto_conoce_todos_los_modelos(modulo):
         timeout=120,
     )
     assert resultado.returncode == 0, resultado.stderr
+
+
+def test_las_bebidas_se_cargan_con_precio_imagen_y_receta(db_session, con_menu_de_ejemplo):
+    _cargar(db_session)
+
+    coca = _producto(db_session, "Coca-Cola 1.5L")
+    assert (coca.price, coca.category.name, coca.is_available) == (6500, "Bebidas", True)
+    assert coca.image is not None and coca.image.content_type == "image/png"
+    assert [(item.ingredient.name, item.quantity) for item in coca.recipe_items] == [("Coca-Cola 1.5L", 1)]
+    assert db_session.query(Ingredient).filter(Ingredient.name == "Coca-Cola 1.5L").one().cost == 3300
+    # Las que ya estaban en el ejemplo no se duplican.
+    assert db_session.query(Product).filter(Product.name == "Coca-Cola 500ml").count() == 1
+
+
+def test_todos_los_productos_tienen_receta_con_costos(db_session, con_menu_de_ejemplo):
+    _cargar(db_session)
+
+    sin_receta = [p.name for p in db_session.query(Product).filter(Product.is_archived.is_(False)) if not p.recipe_items]
+    assert sin_receta == []
+    sin_costo = [i.name for i in db_session.query(Ingredient) if not i.cost]
+    assert sin_costo == []
+
+
+def test_los_ingredientes_de_la_carta_tienen_precio_extra_y_los_adicionales_permitidos(db_session, con_menu_de_ejemplo):
+    _cargar(db_session)
+
+    assert db_session.query(Ingredient).filter(Ingredient.name == "Muzzarella").one().extra_price == 3500
+    adicionales = {i.name for i in _producto(db_session, "Napolitana").allowed_extras}
+    assert {"Muzzarella", "Jamón", "Panceta"} <= adicionales
+    assert all(i.extra_price > 0 for i in _producto(db_session, "Napolitana").allowed_extras)
+
+
+def test_recargar_no_pisa_los_costos_ajustados_a_mano(db_session, con_menu_de_ejemplo):
+    _cargar(db_session)
+    muzza = db_session.query(Ingredient).filter(Ingredient.name == "Muzzarella").one()
+    muzza.cost = 12
+    db_session.commit()
+
+    _cargar(db_session)
+
+    assert db_session.query(Ingredient).filter(Ingredient.name == "Muzzarella").one().cost == 12

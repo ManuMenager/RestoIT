@@ -27,7 +27,7 @@ test.describe('Pedido web de un cliente', () => {
     await productCard(page, 'Flan casero').getByRole('button', { name: 'Agregar' }).click();
     await page.getByRole('button', { name: 'Quitar Flan casero del carrito' }).click();
 
-    await expect(page.getByText(money(2 * 8500 + 2500)).last()).toBeVisible();
+    await expect(page.getByText(money(2 * 8500 + 3500)).last()).toBeVisible();
 
     await page.getByLabel('Nombre').fill(nombre);
     await page.getByLabel('Teléfono').fill('11 5555-1234');
@@ -40,7 +40,7 @@ test.describe('Pedido web de un cliente', () => {
     await expect(page.getByText('Pizza Muzzarella x2')).toBeVisible();
     await expect(page.getByText('Coca-Cola 500ml x1')).toBeVisible();
     await expect(page.getByText(nombre)).toBeVisible();
-    await expect(page.getByText(money(19500)).last()).toBeVisible();
+    await expect(page.getByText(money(20500)).last()).toBeVisible();
 
     await page.getByRole('button', { name: 'Realizar otro pedido' }).click();
     await expect(page.getByText('Tu carrito está vacío')).toBeVisible();

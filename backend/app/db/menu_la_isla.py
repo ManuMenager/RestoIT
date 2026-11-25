@@ -12,6 +12,7 @@ Las cantidades y costos reales se ajustan después desde el panel.
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import time
 
@@ -22,7 +23,15 @@ from app.core.errors import DomainError
 # Registra todos los modelos: al correr el script solo, sin esto SQLAlchemy no encuentra las clases
 # que las relaciones nombran como texto (por ejemplo DeliveryDriver desde Order).
 from app.db import base  # noqa: F401
-from app.db.seed import CATEGORIAS_DE_EJEMPLO, INGREDIENTES_DE_EJEMPLO, PRODUCTOS_DE_EJEMPLO
+from app.db.bebidas import BEBIDAS
+from app.db.ingredientes import (
+    EXTRAS_PAPAS,
+    EXTRAS_PIZZA,
+    EXTRAS_SANDWICH,
+    INGREDIENTES,
+    UNIDADES,
+)
+from app.db.seed import CATEGORIAS_DE_EJEMPLO, INGREDIENTES_DE_EJEMPLO, PRODUCTOS_DE_EJEMPLO, cargar_bebida
 from app.db.session import SessionLocal, transaction
 from app.models.menu import Category, Ingredient, Product
 from app.models.promotion import Promotion
@@ -36,9 +45,6 @@ STORE_NAME = "La Isla"
 STORE_ADDRESS = "O'Higgins 999 esq. Tucumán, Quilmes Oeste"
 STORE_PHONE = "4976-0078 / 4040-9695 / WhatsApp 11-3016-5712"
 
-# Unidad con la que se cargan los ingredientes: las cartas no dicen gramos.
-UNIDAD = "porciones"
-
 GRANDE_CHICA = ("Grande", "Chica")
 CARNE_POLLO = ("Carne", "Pollo")
 
@@ -49,7 +55,8 @@ class Producto:
     descripcion: str
     # Un precio, o uno por variante en el orden de la categoría (ej. Grande y Chica).
     precios: tuple[float, ...]
-    # Ingredientes de la carta (nombre como ingrediente del local, porciones). Vacío: la carta no los detalla.
+    # Receta: (ingrediente del local, cantidad en su unidad de medida). Los ingredientes de la carta son los de la
+    # descripción; el resto (masa, tapa, aceite) se agrega para que el costo del producto sea completo.
     receta: tuple[tuple[str, float], ...] = ()
     restricciones: tuple[str, ...] = ()
 
@@ -60,22 +67,50 @@ class Seccion:
     sector: str
     variantes: tuple[str, ...]
     productos: list[Producto] = field(default_factory=list)
+    # Ingredientes que se pueden pedir como adicional en los productos de la sección.
+    extras: tuple[str, ...] = ()
 
 
-def _receta(*ingredientes: str) -> tuple[tuple[str, float], ...]:
-    return tuple((nombre, 1.0) for nombre in ingredientes)
+def _cantidad(nombre: str, escala: float) -> float:
+    """Cantidad habitual del ingrediente en el producto; lo que se cuenta por unidad (tapas, huevos) no se escala."""
+    datos = INGREDIENTES[nombre]
+    return round(datos.cantidad * (1 if datos.unidad == UNIDADES else escala), 1)
 
 
-def _descripcion(ingredientes: tuple[tuple[str, float], ...]) -> str:
-    nombres = [nombre if cantidad == 1 else f"doble {nombre.lower()}" for nombre, cantidad in ingredientes]
-    nombres = [nombres[0], *(n.lower() for n in nombres[1:])]
+def _receta(*ingredientes: str, escala: float = 1.0) -> tuple[tuple[str, float], ...]:
+    return tuple((nombre, _cantidad(nombre, escala)) for nombre in ingredientes)
+
+
+def _doble(receta: tuple[tuple[str, float], ...], ingrediente: str) -> tuple[tuple[str, float], ...]:
+    return tuple((nombre, cantidad * 2 if nombre == ingrediente else cantidad) for nombre, cantidad in receta)
+
+
+def _descripcion(ingredientes: tuple[str, ...]) -> str:
+    nombres = [ingredientes[0], *(n.lower() for n in ingredientes[1:])]
     texto = nombres[0] if len(nombres) == 1 else f"{', '.join(nombres[:-1])} y {nombres[-1]}"
     return f"{texto}."
 
 
-def _con_ingredientes(nombre: str, precios: tuple[float, ...], *ingredientes: str, **extra) -> Producto:
-    receta = _receta(*ingredientes)
-    return Producto(nombre, _descripcion(receta), precios, receta, **extra)
+def _con_ingredientes(
+    nombre: str,
+    precios: tuple[float, ...],
+    *ingredientes: str,
+    agregados: tuple[str, ...] = (),
+    escala: float = 1.0,
+    **extra,
+) -> Producto:
+    """Producto cuya descripción son sus ingredientes; `agregados` suma a la receta lo que la carta no nombra."""
+    return Producto(
+        nombre, _descripcion(ingredientes), precios, _receta(*agregados, *ingredientes, escala=escala), **extra
+    )
+
+
+def _pizza(nombre: str, precios: tuple[float, ...], *ingredientes: str, **extra) -> Producto:
+    return _con_ingredientes(nombre, precios, *ingredientes, agregados=("Masa de pizza",), **extra)
+
+
+def _empanada(nombre: str, precios: tuple[float, ...], *ingredientes: str, **extra) -> Producto:
+    return _con_ingredientes(nombre, precios, *ingredientes, agregados=("Tapa de empanada",), escala=0.12, **extra)
 
 
 _BASE = ("Salsa", "Muzzarella")
@@ -86,38 +121,32 @@ PIZZAS = Seccion(
     "pizzeria",
     GRANDE_CHICA,
     [
-        _con_ingredientes("Muzzarella", (16000, 14000), *_BASE, *_FINAL),
+        _pizza("Muzzarella", (16000, 14000), *_BASE, *_FINAL),
         Producto(
             "Muzzarella Doble",
             "Salsa, doble muzzarella, orégano y aceitunas.",
             (19000, 17000),
-            (("Salsa", 1), ("Muzzarella", 2), ("Orégano", 1), ("Aceitunas", 1)),
+            _doble(_receta("Masa de pizza", *_BASE, *_FINAL), "Muzzarella"),
         ),
-        _con_ingredientes("Muzzarella con Jamón", (19000, 17000), *_BASE, "Jamón", *_FINAL),
-        _con_ingredientes("Muzzarella con Morrón", (19000, 17000), *_BASE, "Morrón", *_FINAL),
-        _con_ingredientes("Especial", (20000, 18000), *_BASE, "Jamón", "Morrón", *_FINAL),
-        _con_ingredientes("Napolitana", (19000, 17000), *_BASE, "Tomate", "Queso sardo", "Ajo", *_FINAL),
-        _con_ingredientes(
-            "Napolitana con Jamón", (20000, 18000), *_BASE, "Jamón", "Tomate", "Queso sardo", "Ajo", *_FINAL
-        ),
-        _con_ingredientes("Calabresa", (19500, 17500), *_BASE, "Longaniza", *_FINAL),
-        _con_ingredientes("Fugazza", (16000, 14000), "Cebolla", *_FINAL),
-        _con_ingredientes("Fugazza con Muzza", (19000, 17000), "Cebolla", "Muzzarella", *_FINAL),
-        _con_ingredientes("Fugazza con Muzza y Jamón", (20000, 18000), "Cebolla", "Muzzarella", "Jamón", *_FINAL),
-        _con_ingredientes("Americana", (21000, 19000), *_BASE, "Jamón", "Huevo frito", *_FINAL),
-        _con_ingredientes(
-            "Cuatro Quesos", (21000, 19000), *_BASE, "Provolone", "Queso sardo", "Roquefort", *_FINAL
-        ),
-        _con_ingredientes("Provolone", (20000, 18000), *_BASE, "Provolone", "Morrón", *_FINAL),
-        _con_ingredientes("Roquefort", (20000, 18000), *_BASE, "Roquefort", "Morrón", *_FINAL),
-        _con_ingredientes(
-            "Capresse", (20000, 18000), *_BASE, "Tomate", "Albahaca", *_FINAL, restricciones=("vegetariano",)
-        ),
-        _con_ingredientes("Marinera", (20000, 18000), *_BASE, "Huevo duro", "Morrón", *_FINAL),
-        _con_ingredientes("Romana", (21000, 19000), *_BASE, "Huevo duro", "Jamón", *_FINAL),
-        _con_ingredientes("Alemana", (20000, 18000), *_BASE, "Salchicha", "Mostaza", *_FINAL),
-        _con_ingredientes("Rúcula con Jamón Crudo", (21000, 19000), *_BASE, "Jamón crudo", "Rúcula", *_FINAL),
-        _con_ingredientes(
+        _pizza("Muzzarella con Jamón", (19000, 17000), *_BASE, "Jamón", *_FINAL),
+        _pizza("Muzzarella con Morrón", (19000, 17000), *_BASE, "Morrón", *_FINAL),
+        _pizza("Especial", (20000, 18000), *_BASE, "Jamón", "Morrón", *_FINAL),
+        _pizza("Napolitana", (19000, 17000), *_BASE, "Tomate", "Queso sardo", "Ajo", *_FINAL),
+        _pizza("Napolitana con Jamón", (20000, 18000), *_BASE, "Jamón", "Tomate", "Queso sardo", "Ajo", *_FINAL),
+        _pizza("Calabresa", (19500, 17500), *_BASE, "Longaniza", *_FINAL),
+        _pizza("Fugazza", (16000, 14000), "Cebolla", *_FINAL),
+        _pizza("Fugazza con Muzza", (19000, 17000), "Cebolla", "Muzzarella", *_FINAL),
+        _pizza("Fugazza con Muzza y Jamón", (20000, 18000), "Cebolla", "Muzzarella", "Jamón", *_FINAL),
+        _pizza("Americana", (21000, 19000), *_BASE, "Jamón", "Huevo frito", *_FINAL),
+        _pizza("Cuatro Quesos", (21000, 19000), *_BASE, "Provolone", "Queso sardo", "Roquefort", *_FINAL),
+        _pizza("Provolone", (20000, 18000), *_BASE, "Provolone", "Morrón", *_FINAL),
+        _pizza("Roquefort", (20000, 18000), *_BASE, "Roquefort", "Morrón", *_FINAL),
+        _pizza("Capresse", (20000, 18000), *_BASE, "Tomate", "Albahaca", *_FINAL, restricciones=("vegetariano",)),
+        _pizza("Marinera", (20000, 18000), *_BASE, "Huevo duro", "Morrón", *_FINAL),
+        _pizza("Romana", (21000, 19000), *_BASE, "Huevo duro", "Jamón", *_FINAL),
+        _pizza("Alemana", (20000, 18000), *_BASE, "Salchicha", "Mostaza", *_FINAL),
+        _pizza("Rúcula con Jamón Crudo", (21000, 19000), *_BASE, "Jamón crudo", "Rúcula", *_FINAL),
+        _pizza(
             "Especial La Isla",
             (22000, 20000),
             "Cebolla",
@@ -127,10 +156,8 @@ PIZZAS = Seccion(
             "Cheddar",
             *_FINAL,
         ),
-        _con_ingredientes(
-            "Palmitos", (22000, 20000), *_BASE, "Palmitos", "Huevo duro", "Morrón", "Salsa golf", *_FINAL
-        ),
-        _con_ingredientes(
+        _pizza("Palmitos", (22000, 20000), *_BASE, "Palmitos", "Huevo duro", "Morrón", "Salsa golf", *_FINAL),
+        _pizza(
             "Verdura",
             (20000, 18000),
             *_BASE,
@@ -142,8 +169,8 @@ PIZZAS = Seccion(
             *_FINAL,
             restricciones=("vegetariano",),
         ),
-        _con_ingredientes("Sorrentina", (21000, 19000), *_BASE, "Jamón", "Provolone", *_FINAL),
-        _con_ingredientes(
+        _pizza("Sorrentina", (21000, 19000), *_BASE, "Jamón", "Provolone", *_FINAL),
+        _pizza(
             "Humita",
             (20000, 18000),
             *_BASE,
@@ -153,39 +180,101 @@ PIZZAS = Seccion(
             *_FINAL,
             restricciones=("vegetariano",),
         ),
-        _con_ingredientes("Panceta Provolone", (22000, 20000), *_BASE, "Panceta", "Provolone", *_FINAL),
-        _con_ingredientes("Brasilera", (20000, 18000), *_BASE, "Jamón", "Ananá", "Cereza", "Azúcar negra"),
-        _con_ingredientes("Anchoas", (18000, 16000), "Salsa", "Anchoas", *_FINAL),
-        _con_ingredientes("Anchoas con Muzzarella", (19000, 17000), *_BASE, "Anchoas", *_FINAL),
-        _con_ingredientes("Cheddar y Bacon", (22000, 20000), *_BASE, "Panceta", "Cheddar", "Salsa barbacoa", *_FINAL),
+        _pizza("Panceta Provolone", (22000, 20000), *_BASE, "Panceta", "Provolone", *_FINAL),
+        _pizza("Brasilera", (20000, 18000), *_BASE, "Jamón", "Ananá", "Cereza", "Azúcar negra"),
+        _pizza("Anchoas", (18000, 16000), "Salsa", "Anchoas", *_FINAL),
+        _pizza("Anchoas con Muzzarella", (19000, 17000), *_BASE, "Anchoas", *_FINAL),
+        _pizza("Cheddar y Bacon", (22000, 20000), *_BASE, "Panceta", "Cheddar", "Salsa barbacoa", *_FINAL),
     ],
+    extras=EXTRAS_PIZZA,
 )
+
+_R_FUGAZZETA = ("Masa de pizza", "Cebolla", "Muzzarella")
 
 PIZZAS_RELLENAS = Seccion(
     "Pizzas Rellenas",
     "pizzeria",
     (),
     [
-        Producto("Porción de Fugazzeta (JyQ)", "Porción de fugazzeta rellena de jamón y queso.", (3500,)),
-        Producto("Fugazzeta con Muzzarella", "Fugazzeta rellena de muzzarella.", (24000,)),
-        Producto("Fugazzeta con Muzza y Jamón", "Fugazzeta rellena de muzzarella y jamón.", (27000,)),
-        Producto("Fugazzeta con Jamón y Tomate", "Fugazzeta rellena de jamón y tomate.", (28000,)),
-        Producto("Calzone Napolitano", "Calzone napolitano.", (23000,)),
-        Producto("Calzone Germano", "Calzone germano.", (22000,)),
-        Producto("Calzone Calabrés", "Calzone calabrés.", (22000,)),
+        Producto(
+            "Porción de Fugazzeta (JyQ)",
+            "Porción de fugazzeta rellena de jamón y queso.",
+            (3500,),
+            _receta(*_R_FUGAZZETA, "Jamón", escala=0.15),
+        ),
+        Producto(
+            "Fugazzeta con Muzzarella",
+            "Fugazzeta rellena de muzzarella.",
+            (24000,),
+            _doble(_receta(*_R_FUGAZZETA, escala=1.4), "Muzzarella"),
+        ),
+        Producto(
+            "Fugazzeta con Muzza y Jamón",
+            "Fugazzeta rellena de muzzarella y jamón.",
+            (27000,),
+            _doble(_receta(*_R_FUGAZZETA, "Jamón", escala=1.4), "Muzzarella"),
+        ),
+        Producto(
+            "Fugazzeta con Jamón y Tomate",
+            "Fugazzeta rellena de jamón y tomate.",
+            (28000,),
+            _receta(*_R_FUGAZZETA, "Jamón", "Tomate", escala=1.4),
+        ),
+        Producto(
+            "Calzone Napolitano",
+            "Calzone napolitano.",
+            (23000,),
+            _receta("Masa de pizza", "Salsa", "Muzzarella", "Jamón", "Tomate", "Orégano", escala=1.2),
+        ),
+        Producto(
+            "Calzone Germano",
+            "Calzone germano.",
+            (22000,),
+            _receta("Masa de pizza", "Salsa", "Muzzarella", "Salchicha", "Mostaza", escala=1.2),
+        ),
+        Producto(
+            "Calzone Calabrés",
+            "Calzone calabrés.",
+            (22000,),
+            _receta("Masa de pizza", "Salsa", "Muzzarella", "Longaniza", "Morrón", escala=1.2),
+        ),
     ],
+    extras=EXTRAS_PIZZA,
 )
+
+_PIZZANEZA = ("Milanesa", "Papa", "Aceite de girasol")
 
 PIZZANEZAS = Seccion(
     "Pizzanezas",
     "pizzeria",
     CARNE_POLLO,
     [
-        Producto("Pizzaneza Napolitana", "Milanesa de carne o pollo a la napolitana, con lluvia de papas fritas.", (38000, 36000)),
-        Producto("Pizzaneza 4 Quesos", "Milanesa de carne o pollo cuatro quesos, con lluvia de papas fritas.", (38000, 36000)),
-        Producto("Pizzaneza La Isla", "Milanesa de carne o pollo especial La Isla, con lluvia de papas fritas.", (44000, 41000)),
-        Producto("Pizzaneza Fugazza", "Milanesa de carne o pollo a la fugazza, con lluvia de papas fritas.", (36000, 34000)),
+        Producto(
+            "Pizzaneza Napolitana",
+            "Milanesa de carne o pollo a la napolitana, con lluvia de papas fritas.",
+            (38000, 36000),
+            _receta(*_PIZZANEZA, "Salsa", "Muzzarella", "Tomate", "Ajo"),
+        ),
+        Producto(
+            "Pizzaneza 4 Quesos",
+            "Milanesa de carne o pollo cuatro quesos, con lluvia de papas fritas.",
+            (38000, 36000),
+            _receta(*_PIZZANEZA, "Salsa", "Muzzarella", "Provolone", "Queso sardo", "Roquefort"),
+        ),
+        Producto(
+            "Pizzaneza La Isla",
+            "Milanesa de carne o pollo especial La Isla, con lluvia de papas fritas.",
+            (44000, 41000),
+            _receta(*_PIZZANEZA, "Salsa", "Muzzarella", "Jamón", "Huevo frito", "Panceta", "Cheddar"),
+        ),
+        Producto(
+            "Pizzaneza Fugazza",
+            "Milanesa de carne o pollo a la fugazza, con lluvia de papas fritas.",
+            (36000, 34000),
+            _receta(*_PIZZANEZA, "Cebolla", "Muzzarella"),
+        ),
     ],
+    extras=EXTRAS_SANDWICH,
 )
 
 FAINA = Seccion(
@@ -193,9 +282,26 @@ FAINA = Seccion(
     "pizzeria",
     (),
     [
-        Producto("Fainá Tradicional", "Porción de fainá tradicional.", (1500,), restricciones=("vegetariano",)),
-        Producto("Fainá al Verdeo", "Porción de fainá al verdeo.", (2000,), restricciones=("vegetariano",)),
-        Producto("Fainá Rellena", "Porción de fainá rellena.", (3000,)),
+        Producto(
+            "Fainá Tradicional",
+            "Porción de fainá tradicional.",
+            (1500,),
+            _receta("Harina de garbanzo", "Aceite de girasol"),
+            ("vegetariano",),
+        ),
+        Producto(
+            "Fainá al Verdeo",
+            "Porción de fainá al verdeo.",
+            (2000,),
+            _receta("Harina de garbanzo", "Aceite de girasol", "Verdeo"),
+            ("vegetariano",),
+        ),
+        Producto(
+            "Fainá Rellena",
+            "Porción de fainá rellena.",
+            (3000,),
+            _receta("Harina de garbanzo", "Aceite de girasol", "Muzzarella", "Jamón", escala=0.5),
+        ),
     ],
 )
 
@@ -206,20 +312,20 @@ EMPANADAS = Seccion(
     "cocina",
     (),
     [
-        _con_ingredientes("Empanada Carne Suave", _EMPANADA, "Carne picada", "Cebolla", "Huevo", "Morrón", "Verdeo"),
-        _con_ingredientes(
+        _empanada("Empanada Carne Suave", _EMPANADA, "Carne picada", "Cebolla", "Huevo", "Morrón", "Verdeo"),
+        _empanada(
             "Empanada Carne Picante", _EMPANADA, "Carne picada", "Cebolla", "Verdeo", "Pimentón", "Salsa picante"
         ),
-        _con_ingredientes(
+        _empanada(
             "Empanada Carne Cuchillo", _EMPANADA, "Carne cortada a cuchillo", "Morrón", "Verdeo", "Cebolla", "Huevo"
         ),
-        _con_ingredientes("Empanada Jamón y Queso", _EMPANADA, "Jamón", "Muzzarella"),
-        _con_ingredientes(
+        _empanada("Empanada Jamón y Queso", _EMPANADA, "Jamón", "Muzzarella"),
+        _empanada(
             "Empanada Cebolla y Queso", _EMPANADA, "Cebolla", "Orégano", "Muzzarella", restricciones=("vegetariano",)
         ),
-        _con_ingredientes("Empanada Pollo al Roquefort", _EMPANADA, "Pollo", "Roquefort", "Jamón", "Muzzarella"),
-        _con_ingredientes("Empanada Pollo al Verdeo", _EMPANADA, "Pollo", "Verdeo", "Salsa blanca"),
-        _con_ingredientes(
+        _empanada("Empanada Pollo al Roquefort", _EMPANADA, "Pollo", "Roquefort", "Jamón", "Muzzarella"),
+        _empanada("Empanada Pollo al Verdeo", _EMPANADA, "Pollo", "Verdeo", "Salsa blanca"),
+        _empanada(
             "Empanada Capresse",
             _EMPANADA,
             "Tomate cherry",
@@ -228,9 +334,9 @@ EMPANADAS = Seccion(
             "Aceite de oliva",
             restricciones=("vegetariano",),
         ),
-        _con_ingredientes("Empanada Alemana", _EMPANADA, "Salchicha", "Mostaza", "Muzzarella"),
-        _con_ingredientes("Empanada Calabresa", _EMPANADA, "Muzzarella", "Longaniza"),
-        _con_ingredientes(
+        _empanada("Empanada Alemana", _EMPANADA, "Salchicha", "Mostaza", "Muzzarella"),
+        _empanada("Empanada Calabresa", _EMPANADA, "Muzzarella", "Longaniza"),
+        _empanada(
             "Empanada Humita",
             _EMPANADA,
             "Choclo",
@@ -239,8 +345,8 @@ EMPANADAS = Seccion(
             "Queso reggianito",
             restricciones=("vegetariano",),
         ),
-        _con_ingredientes("Empanada Pollo", _EMPANADA, "Pollo", "Cebolla", "Huevo", "Morrón", "Verdeo"),
-        _con_ingredientes(
+        _empanada("Empanada Pollo", _EMPANADA, "Pollo", "Cebolla", "Huevo", "Morrón", "Verdeo"),
+        _empanada(
             "Empanada Verdura",
             _EMPANADA,
             "Acelga",
@@ -249,12 +355,27 @@ EMPANADAS = Seccion(
             "Queso reggianito",
             restricciones=("vegetariano",),
         ),
-        _con_ingredientes("Empanada Roquefort con Jamón", _EMPANADA, "Muzzarella", "Jamón", "Roquefort"),
-        _con_ingredientes("Empanada Jamón y Ananá", _EMPANADA, "Jamón", "Muzzarella", "Ananá"),
-        _con_ingredientes("Empanada Salchicha y Cheddar", _EMPANADA, "Salchicha", "Cheddar"),
-        Producto("Empanada Cheeseburguer", "Empanada de cheeseburguer.", _EMPANADA),
-        Producto("Empanada Vacío", "Empanada de vacío.", _EMPANADA),
-        Producto("Empanada Bondiola", "Empanada de bondiola.", _EMPANADA),
+        _empanada("Empanada Roquefort con Jamón", _EMPANADA, "Muzzarella", "Jamón", "Roquefort"),
+        _empanada("Empanada Jamón y Ananá", _EMPANADA, "Jamón", "Muzzarella", "Ananá"),
+        _empanada("Empanada Salchicha y Cheddar", _EMPANADA, "Salchicha", "Cheddar"),
+        Producto(
+            "Empanada Cheeseburguer",
+            "Empanada de cheeseburguer.",
+            _EMPANADA,
+            _receta("Tapa de empanada", "Carne picada", "Cheddar", "Cebolla", "Ketchup", escala=0.12),
+        ),
+        Producto(
+            "Empanada Vacío",
+            "Empanada de vacío.",
+            _EMPANADA,
+            _receta("Tapa de empanada", "Vacío", "Cebolla", "Morrón", escala=0.12),
+        ),
+        Producto(
+            "Empanada Bondiola",
+            "Empanada de bondiola.",
+            _EMPANADA,
+            _receta("Tapa de empanada", "Bondiola", "Cebolla", "Salsa barbacoa", escala=0.12),
+        ),
     ],
 )
 
@@ -263,15 +384,26 @@ SANDWICHES = Seccion(
     "cocina",
     CARNE_POLLO,
     [
-        Producto("Milanesa Individual", "Sándwich individual de milanesa de carne o pollo, con pan de pizza.", (8000, 7000), _receta("Pan de pizza", "Milanesa")),
-        Producto("Milanesa Simple", "Milanesa de carne o pollo, con pan de pizza. Para compartir.", (16000, 14000), _receta("Pan de pizza", "Milanesa")),
+        Producto(
+            "Milanesa Individual",
+            "Sándwich individual de milanesa de carne o pollo, con pan de pizza.",
+            (8000, 7000),
+            _receta("Pan de pizza", "Milanesa", escala=0.5),
+        ),
+        Producto(
+            "Milanesa Simple",
+            "Milanesa de carne o pollo, con pan de pizza. Para compartir.",
+            (16000, 14000),
+            _receta("Pan de pizza", "Milanesa", escala=0.8),
+        ),
         Producto(
             "Milanesa Completa",
             "Milanesa de carne o pollo, tomate, cheddar, jamón y huevo rallado, con pan de pizza. Para compartir.",
             (19000, 17000),
-            _receta("Pan de pizza", "Milanesa", "Tomate", "Cheddar", "Jamón", "Huevo duro"),
+            _receta("Pan de pizza", "Milanesa", "Tomate", "Cheddar", "Jamón", "Huevo duro", escala=0.8),
         ),
     ],
+    extras=EXTRAS_SANDWICH,
 )
 
 SANDWICHES_SIN_VARIANTES = Seccion(
@@ -279,40 +411,48 @@ SANDWICHES_SIN_VARIANTES = Seccion(
     "cocina",
     (),
     [
-        Producto("Lomo y Muzzarella", "Lomito y muzzarella, con pan de pizza. Para compartir.", (21000,), _receta("Pan de pizza", "Lomito", "Muzzarella")),
+        Producto(
+            "Lomo y Muzzarella",
+            "Lomito y muzzarella, con pan de pizza. Para compartir.",
+            (21000,),
+            _receta("Pan de pizza", "Lomito", "Muzzarella", escala=0.8),
+        ),
         Producto(
             "Pollo y Muzzarella",
             "Churrasquito de pollo y muzzarella, con pan de pizza. Para compartir.",
             (17000,),
-            _receta("Pan de pizza", "Churrasquito de pollo", "Muzzarella"),
+            _receta("Pan de pizza", "Churrasquito de pollo", "Muzzarella", escala=0.8),
         ),
         Producto(
             "Especial de Lomo",
             "Lomito, cheddar, cebolla, muzzarella, huevo y panceta, con pan de pizza. Para compartir.",
             (23000,),
-            _receta("Pan de pizza", "Lomito", "Cheddar", "Cebolla", "Muzzarella", "Huevo", "Panceta"),
+            _receta("Pan de pizza", "Lomito", "Cheddar", "Cebolla", "Muzzarella", "Huevo", "Panceta", escala=0.8),
         ),
         Producto(
             "Especial de Pollo",
             "Churrasquito de pollo, muzzarella, rúcula, tomate y jamón crudo, con pan de pizza. Para compartir.",
             (19000,),
-            _receta("Pan de pizza", "Churrasquito de pollo", "Muzzarella", "Rúcula", "Tomate", "Jamón crudo"),
+            _receta(
+                "Pan de pizza", "Churrasquito de pollo", "Muzzarella", "Rúcula", "Tomate", "Jamón crudo", escala=0.8
+            ),
         ),
         Producto(
             "Veggie Capresse",
             "Muzzarella, tomate y albahaca, con pan de pizza. Para compartir.",
             (11000,),
-            _receta("Pan de pizza", "Muzzarella", "Tomate", "Albahaca"),
+            _receta("Pan de pizza", "Muzzarella", "Tomate", "Albahaca", escala=0.8),
             ("vegetariano",),
         ),
         Producto(
             "Veggie Especial Rúcula",
             "Muzzarella, tomate, rúcula, ajo y queso sardo, con pan de pizza. Para compartir.",
             (11000,),
-            _receta("Pan de pizza", "Muzzarella", "Tomate", "Rúcula", "Ajo", "Queso sardo"),
+            _receta("Pan de pizza", "Muzzarella", "Tomate", "Rúcula", "Ajo", "Queso sardo", escala=0.8),
             ("vegetariano",),
         ),
     ],
+    extras=EXTRAS_SANDWICH,
 )
 
 PAPAS = Seccion(
@@ -320,12 +460,36 @@ PAPAS = Seccion(
     "cocina",
     (),
     [
-        Producto("Porción de Fritas", "Porción de papas fritas.", (7000,), restricciones=("vegetariano",)),
-        Producto("Porción de Fritas con Panceta y Cheddar", "Papas fritas con panceta y cheddar.", (10000,)),
+        Producto(
+            "Porción de Fritas",
+            "Porción de papas fritas.",
+            (7000,),
+            _receta("Papa", "Aceite de girasol"),
+            ("vegetariano",),
+        ),
+        Producto(
+            "Porción de Fritas con Panceta y Cheddar",
+            "Papas fritas con panceta y cheddar.",
+            (10000,),
+            _receta("Papa", "Aceite de girasol", "Panceta", "Cheddar"),
+        ),
     ],
+    extras=EXTRAS_PAPAS,
 )
 
-SECCIONES = [PIZZAS, PIZZAS_RELLENAS, PIZZANEZAS, FAINA, EMPANADAS, SANDWICHES, SANDWICHES_SIN_VARIANTES, PAPAS]
+BEBIDAS_DE_LA_CARTA = Seccion("Bebidas", "barra", ())
+
+SECCIONES = [
+    PIZZAS,
+    PIZZAS_RELLENAS,
+    PIZZANEZAS,
+    FAINA,
+    EMPANADAS,
+    SANDWICHES,
+    SANDWICHES_SIN_VARIANTES,
+    PAPAS,
+    BEBIDAS_DE_LA_CARTA,
+]
 
 
 @dataclass(frozen=True)
@@ -388,8 +552,17 @@ def _ingrediente(db: Session, nombre: str, cache: dict[str, Ingredient]) -> Ingr
         if ingrediente is None:
             ingrediente = Ingredient(name=nombre)
             db.add(ingrediente)
-        # Las recetas de La Isla se cargan en porciones (un ingrediente del ejemplo podía estar en gramos).
-        ingrediente.unit = UNIDAD
+        datos = INGREDIENTES[nombre]
+        # Un ingrediente del ejemplo podía estar en otra unidad (gramos, hojas): su costo ya no sirve.
+        if ingrediente.unit != datos.unidad:
+            ingrediente.unit = datos.unidad
+            ingrediente.cost = 0
+            ingrediente.extra_price = 0
+        # Los costos y extras solo se cargan donde no hay ninguno: lo que el local ajustó en el panel no se pisa.
+        if not ingrediente.cost:
+            ingrediente.cost = datos.costo
+        if not ingrediente.extra_price:
+            ingrediente.extra_price = datos.extra
         db.flush()
         cache[clave] = ingrediente
     return cache[clave]
@@ -415,6 +588,7 @@ def _cargar_producto(db: Session, seccion: Seccion, categoria: Category, datos: 
     db.flush()
     if datos.receta:
         producto.replace_recipe([(_ingrediente(db, nombre, cache), cantidad) for nombre, cantidad in datos.receta])
+    producto.replace_allowed_extras([_ingrediente(db, nombre, cache) for nombre in seccion.extras])
     return producto
 
 
@@ -426,6 +600,10 @@ def _cargar_menu(db: Session) -> set[str]:
         for datos in seccion.productos:
             _cargar_producto(db, seccion, categoria, datos, cache)
             nombres.add(datos.nombre)
+        if seccion is BEBIDAS_DE_LA_CARTA:
+            for bebida in BEBIDAS:
+                cargar_bebida(db, categoria, bebida, actualizar=True)
+                nombres.add(bebida.nombre)
     db.flush()
     return nombres
 
@@ -512,6 +690,11 @@ def run() -> None:
     )
     if resumen["sacados"]:
         print(f"Productos que ya no se ofrecen: {', '.join(resumen['sacados'])}.")
+    # Los pedidos de ejemplo se arman sobre este menú (ver app/db/seed_pedidos.py). SEED_PEDIDOS=0 los desactiva.
+    if os.environ.get("SEED_PEDIDOS", "").strip() != "0":
+        from app.db.seed_pedidos import run as cargar_pedidos
+
+        cargar_pedidos()
 
 
 if __name__ == "__main__":
