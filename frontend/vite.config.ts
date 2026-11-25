@@ -1,0 +1,36 @@
+/// <reference types="vitest/config" />
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+import path from 'path'
+
+export default defineConfig({
+  plugins: [
+    react(),
+    tailwindcss(),
+  ],
+  resolve: {
+    alias: {
+      '@': path.resolve(import.meta.dirname, './src'),
+    },
+  },
+  // Railway sirve el front bajo un dominio *.up.railway.app; sin esto `vite preview` lo rechaza.
+  preview: {
+    allowedHosts: true,
+  },
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+    include: ['src/**/*.test.{ts,tsx}'],
+    // Con toda la suite en paralelo (como en el CI) las pruebas de pantallas completas pueden tardar más que los 5 s por defecto.
+    testTimeout: 20000,
+    // Misma zona horaria que el local para que las fechas de los tests no dependan de la máquina.
+    env: { TZ: 'America/Argentina/Buenos_Aires' },
+    coverage: {
+      provider: 'v8',
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['src/**/*.test.{ts,tsx}', 'src/test/**', 'src/main.tsx', 'src/vite-env.d.ts'],
+      reporter: ['text-summary', 'html', 'lcov'],
+    },
+  },
+})

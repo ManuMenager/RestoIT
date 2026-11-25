@@ -1,0 +1,532 @@
+"""Catálogo del panel: alta y edición de productos (con imagen) y de categorías, y su reflejo en el menú."""
+
+from datetime import datetime, timezone
+from unittest.mock import patch
+
+import pytest
+
+from app.models.menu import MAX_IMAGE_BYTES, Category, Product, ProductImage
+from app.services.tools.menu_tools import obtener_menu_actual
+from tests.conftest import TestingSessionLocal
+
+PRODUCTS_URL = "/api/v1/products"
+CATEGORIES_URL = "/api/v1/categories"
+MENU_URL = "/api/v1/menu/products"
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+JPG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+
+
+@pytest.fixture()
+def bebidas(db_session):
+    categoria = Category(name="Bebidas")
+    db_session.add(categoria)
+    db_session.commit()
+    return categoria
+
+
+def _product_payload(category_id: int, **overrides) -> dict:
+    return {
+        "name": "Fugazzeta",
+        "description": "Cebolla y muzzarella.",
+        "price": 9500,
+        "category_id": category_id,
+        **overrides,
+    }
+
+
+def _menu(client) -> dict[str, str]:
+    """Nombre de cada producto del menú público -> nombre de su categoría."""
+    return {p["name"]: p["category"]["name"] for p in client.get(MENU_URL).json()}
+
+
+# --- Productos ----------------------------------------------------------------------------------------
+
+
+def test_crea_un_producto_y_aparece_en_el_menu_publico(client, db_session, muzza):
+    payload = _product_payload(
+        muzza.category_id, name="  Fugazzeta ", dietary_restrictions=["vegetariano", " Vegetariano ", ""]
+    )
+
+    response = client.post(PRODUCTS_URL, json=payload)
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body == {
+        "id": body["id"],
+        "name": "Fugazzeta",
+        "description": "Cebolla y muzzarella.",
+        "price": 9500,
+        "is_active": True,
+        "dietary_restrictions": ["vegetariano"],
+        "category": {"id": muzza.category_id, "name": "Pizzas"},
+        "image_url": None,
+        "recipe": [],
+        "allowed_extras": [],
+    }
+    assert _menu(client)["Fugazzeta"] == "Pizzas"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"name": " "}, {"description": ""}, {"price": 0}, {"price": -10}, {"category_id": None}],
+)
+def test_nombre_descripcion_precio_y_categoria_son_obligatorios(client, muzza, overrides):
+    assert client.post(PRODUCTS_URL, json={**_product_payload(muzza.category_id), **overrides}).status_code == 422
+
+
+def test_no_permite_productos_con_el_mismo_nombre(client, muzza):
+    response = client.post(PRODUCTS_URL, json=_product_payload(muzza.category_id, name="pizza muzzarella"))
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Ya existe un producto llamado 'pizza muzzarella'."
+
+
+def test_la_categoria_del_producto_tiene_que_existir(client, muzza):
+    response = client.post(PRODUCTS_URL, json=_product_payload(999))
+
+    assert response.status_code == 409
+    assert "La categoría elegida no existe" in response.json()["detail"]
+
+
+def test_edita_toda_la_informacion_de_un_producto(client, db_session, muzza, bebidas):
+    response = client.put(
+        f"{PRODUCTS_URL}/{muzza.id}",
+        json=_product_payload(bebidas.id, name="Muzza grande", price=10000, is_active=False),
+    )
+
+    assert response.status_code == 200
+    db_session.refresh(muzza)
+    assert (muzza.name, muzza.description, muzza.price, muzza.category_id, muzza.is_active) == (
+        "Muzza grande",
+        "Cebolla y muzzarella.",
+        10000,
+        bebidas.id,
+        False,
+    )
+    assert "Muzza grande" not in _menu(client)
+
+
+def test_al_editar_puede_conservar_su_propio_nombre(client, muzza):
+    payload = _product_payload(muzza.category_id, name="Pizza Muzzarella", price=9000)
+
+    assert client.put(f"{PRODUCTS_URL}/{muzza.id}", json=payload).status_code == 200
+
+
+def test_editar_un_producto_inexistente_da_404(client, muzza):
+    assert client.put(f"{PRODUCTS_URL}/999", json=_product_payload(muzza.category_id)).status_code == 404
+
+
+def test_el_listado_del_panel_incluye_los_productos_sin_categoria_al_final(client, db_session, products):
+    products["coca"].category_id = None
+    db_session.commit()
+
+    body = client.get(PRODUCTS_URL).json()
+
+    assert body[-1]["name"] == "Coca-Cola 500ml"
+    assert body[-1]["category"] is None
+
+
+# --- Imagen del producto ------------------------------------------------------------------------------
+
+
+def test_carga_la_imagen_y_se_sirve_publicamente(client, public_client, db_session, muzza):
+    response = client.put(f"{PRODUCTS_URL}/{muzza.id}/image", content=PNG, headers={"Content-Type": "image/png"})
+
+    assert response.status_code == 200
+    image_url = response.json()["image_url"]
+    assert image_url.startswith(f"/menu/products/{muzza.id}/image?v=")
+    menu_item = next(p for p in client.get(MENU_URL).json() if p["id"] == muzza.id)
+    assert menu_item["image_url"] == image_url
+
+    imagen = public_client.get(f"/api/v1{image_url}")
+    assert imagen.status_code == 200
+    assert imagen.headers["content-type"] == "image/png"
+    assert imagen.content == PNG
+
+
+def test_reemplazar_la_imagen_cambia_su_url(client, db_session, muzza):
+    url = f"{PRODUCTS_URL}/{muzza.id}/image"
+    primera = client.put(url, content=PNG, headers={"Content-Type": "image/png"}).json()["image_url"]
+
+    with patch("app.services.catalog_service.datetime") as reloj:
+        reloj.now.return_value = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        segunda = client.put(url, content=JPG, headers={"Content-Type": "image/jpeg"}).json()["image_url"]
+
+    assert segunda != primera
+    imagen = db_session.query(ProductImage).one()
+    assert imagen.content_type == "image/jpeg"
+
+
+def test_el_formato_se_valida_por_el_contenido_del_archivo(client, db_session, muzza):
+    response = client.put(
+        f"{PRODUCTS_URL}/{muzza.id}/image", content=b"GIF89a" + b"\x00" * 10, headers={"Content-Type": "image/png"}
+    )
+
+    assert response.status_code == 415
+    assert response.json()["detail"] == "La imagen tiene que ser un archivo JPG o PNG."
+    assert db_session.query(ProductImage).count() == 0
+
+
+def test_la_imagen_no_puede_superar_los_5_mb(client, db_session, muzza):
+    pesada = PNG + b"\x00" * MAX_IMAGE_BYTES
+
+    response = client.put(f"{PRODUCTS_URL}/{muzza.id}/image", content=pesada, headers={"Content-Type": "image/png"})
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "La imagen no puede pesar más de 5 MB."
+    assert db_session.query(ProductImage).count() == 0
+
+
+def test_elimina_la_imagen(client, public_client, db_session, muzza):
+    client.put(f"{PRODUCTS_URL}/{muzza.id}/image", content=PNG, headers={"Content-Type": "image/png"})
+
+    response = client.delete(f"{PRODUCTS_URL}/{muzza.id}/image")
+
+    assert response.status_code == 200
+    assert response.json()["image_url"] is None
+    assert db_session.query(ProductImage).count() == 0
+    assert public_client.get(f"/api/v1/menu/products/{muzza.id}/image").status_code == 404
+
+
+def test_imagen_de_un_producto_inexistente_da_404(client):
+    assert client.put(f"{PRODUCTS_URL}/999/image", content=PNG).status_code == 404
+    assert client.delete(f"{PRODUCTS_URL}/999/image").status_code == 404
+
+
+# --- Categorías ---------------------------------------------------------------------------------------
+
+
+def test_lista_las_categorias_con_sus_productos(client, products, bebidas):
+    body = client.get(CATEGORIES_URL).json()
+
+    assert [(c["name"], [p["name"] for p in c["products"]]) for c in body] == [
+        ("Bebidas", []),
+        ("Pizzas", ["Coca-Cola 500ml", "Pizza Agotada", "Pizza Muzzarella"]),
+    ]
+
+
+def test_crea_una_categoria_sin_productos(client, db_session):
+    response = client.post(CATEGORIES_URL, json={"name": "  Empanadas "})
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": response.json()["id"],
+        "name": "Empanadas",
+        "sector": "cocina",
+        "products": [],
+    }
+    assert db_session.query(Category).one().name == "Empanadas"
+
+
+def test_crea_una_categoria_moviendo_productos_existentes(client, db_session, products):
+    response = client.post(CATEGORIES_URL, json={"name": "Bebidas", "product_ids": [products["coca"].id]})
+
+    assert response.status_code == 201
+    assert [p["name"] for p in response.json()["products"]] == ["Coca-Cola 500ml"]
+    assert _menu(client) == {"Coca-Cola 500ml": "Bebidas", "Pizza Muzzarella": "Pizzas"}
+
+
+def test_no_permite_categorias_con_el_mismo_nombre(client, products):
+    response = client.post(CATEGORIES_URL, json={"name": "pizzas"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Ya existe una categoría llamada 'pizzas'."
+
+
+def test_no_permite_productos_inexistentes(client, db_session, products):
+    response = client.post(CATEGORIES_URL, json={"name": "Bebidas", "product_ids": [products["coca"].id, 999]})
+
+    assert response.status_code == 409
+    assert db_session.query(Category).count() == 1
+
+
+@pytest.mark.parametrize("payload", [{"name": ""}, {"name": "   "}, {}])
+def test_el_nombre_de_la_categoria_es_obligatorio(client, payload):
+    assert client.post(CATEGORIES_URL, json=payload).status_code == 422
+
+
+def test_edita_el_nombre_y_los_productos_de_una_categoria(client, db_session, products, bebidas):
+    pizzas_id = products["muzza"].category_id
+
+    response = client.put(
+        f"{CATEGORIES_URL}/{bebidas.id}", json={"name": "Bebidas frías", "product_ids": [products["coca"].id]}
+    )
+    assert response.status_code == 200
+    assert response.json()["name"] == "Bebidas frías"
+    assert _menu(client) == {"Coca-Cola 500ml": "Bebidas frías", "Pizza Muzzarella": "Pizzas"}
+
+    # Se quita la muzza de Pizzas: queda sin categoría y deja de ofrecerse.
+    response = client.put(
+        f"{CATEGORIES_URL}/{pizzas_id}", json={"name": "Pizzas", "product_ids": [products["agotada"].id]}
+    )
+    assert [p["name"] for p in response.json()["products"]] == ["Pizza Agotada"]
+    db_session.refresh(products["muzza"])
+    assert products["muzza"].category_id is None
+    assert _menu(client) == {"Coca-Cola 500ml": "Bebidas frías"}
+
+
+def test_editar_una_categoria_inexistente_da_404(client):
+    assert client.put(f"{CATEGORIES_URL}/999", json={"name": "X"}).status_code == 404
+
+
+def test_eliminar_una_categoria_deja_sus_productos_sin_categoria(client, db_session, products):
+    pizzas_id = products["muzza"].category_id
+
+    assert client.delete(f"{CATEGORIES_URL}/{pizzas_id}").status_code == 204
+
+    assert db_session.query(Category).count() == 0
+    assert db_session.query(Product).filter(Product.category_id.is_(None)).count() == 3
+    assert _menu(client) == {}
+    assert client.delete(f"{CATEGORIES_URL}/{pizzas_id}").status_code == 404
+
+
+def test_un_producto_sin_categoria_no_se_puede_pedir(client, db_session, products):
+    products["muzza"].category_id = None
+    db_session.commit()
+
+    response = client.post(
+        "/api/v1/orders/web",
+        json={
+            "customer_name": "Ana",
+            "customer_phone": "1155551234",
+            "delivery_method": "retiro",
+            "items": [{"product_id": products["muzza"].id, "quantity": 1}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Pizza Muzzarella" in response.json()["detail"]
+
+
+def test_los_cambios_del_catalogo_se_reflejan_en_el_menu_del_chatbot(client, db_session, products):
+    client.post(CATEGORIES_URL, json={"name": "Bebidas", "product_ids": [products["coca"].id]})
+    client.put(
+        f"{PRODUCTS_URL}/{products['muzza'].id}",
+        json=_product_payload(products["muzza"].category_id, name="Muzza", description="La clásica."),
+    )
+
+    with patch("app.services.tools.menu_tools.SessionLocal", TestingSessionLocal):
+        menu = obtener_menu_actual()
+
+    assert "- Muzza ($9,500.00) [Pizzas]: La clásica." in menu
+    assert "- Coca-Cola 500ml ($2,500.00) [Bebidas]" in menu
+    assert "Pizza Agotada" not in menu
+
+
+def test_el_catalogo_es_solo_para_administradores(public_client, customer_headers):
+    for method, url in [
+        ("post", PRODUCTS_URL),
+        ("put", f"{PRODUCTS_URL}/1"),
+        ("put", f"{PRODUCTS_URL}/1/image"),
+        ("delete", f"{PRODUCTS_URL}/1/image"),
+        ("get", CATEGORIES_URL),
+        ("post", CATEGORIES_URL),
+        ("put", f"{CATEGORIES_URL}/1"),
+        ("delete", f"{CATEGORIES_URL}/1"),
+    ]:
+        assert getattr(public_client, method)(url).status_code == 401
+        assert getattr(public_client, method)(url, headers=customer_headers).status_code == 403
+
+def test_producto_con_adicionales_permitidos(client, db_session, muzza):
+    from app.models.menu import Ingredient
+    ing1 = Ingredient(name="Queso Cheddar", unit="gramos", extra_price=600)
+    ing2 = Ingredient(name="Huevo Frito", unit="unidades", extra_price=400)
+    db_session.add_all([ing1, ing2])
+    db_session.commit()
+
+    # Crear producto con allowed_extra_ids
+    payload = _product_payload(muzza.category_id)
+    payload["name"] = "Pizza Especial"
+    payload["allowed_extra_ids"] = [ing1.id, ing2.id]
+
+    res = client.post(PRODUCTS_URL, json=payload)
+    assert res.status_code == 201
+    body = res.json()
+    assert len(body["allowed_extras"]) == 2
+    extras_names = {e["name"]: e["extra_price"] for e in body["allowed_extras"]}
+    assert extras_names == {"Queso Cheddar": 600.0, "Huevo Frito": 400.0}
+
+    prod_id = body["id"]
+
+    # Endpoint público de menú expone recipe_ingredients y allowed_extras
+    menu_res = client.get("/api/v1/menu/products")
+    assert menu_res.status_code == 200
+    p = next(x for x in menu_res.json() if x["id"] == prod_id)
+    assert len(p["allowed_extras"]) == 2
+    assert p["recipe_ingredients"] == []
+
+    # Actualizar producto para cambiar allowed_extras
+    payload["allowed_extra_ids"] = [ing1.id]
+    put_res = client.put(f"{PRODUCTS_URL}/{prod_id}", json=payload)
+    assert put_res.status_code == 200
+    assert len(put_res.json()["allowed_extras"]) == 1
+    assert put_res.json()["allowed_extras"][0]["name"] == "Queso Cheddar"
+
+
+# --- Eliminación de productos (US-63) -----------------------------------------------------------------
+
+
+def test_eliminar_producto_sin_promociones_y_sin_pedidos_lo_elimina_completamente(client, db_session, muzza):
+    from app.models.menu import Ingredient, ProductIngredient
+
+    ing = Ingredient(name="Salsa de Tomate", unit="litros")
+    db_session.add(ing)
+    db_session.commit()
+
+    muzza.recipe_items.append(ProductIngredient(ingredient=ing, quantity=0.2))
+    muzza.replace_image(PNG, now=datetime.now(timezone.utc))
+    db_session.commit()
+    prod_id = muzza.id
+
+    res = client.delete(f"{PRODUCTS_URL}/{prod_id}")
+    assert res.status_code == 204
+
+    # No aparece en menú público ni en listado admin
+    assert all(p["id"] != prod_id for p in client.get(MENU_URL).json())
+    assert all(p["id"] != prod_id for p in client.get(PRODUCTS_URL).json())
+
+    # Se borró físicamente de la base
+    db_session.expire_all()
+    assert db_session.get(Product, prod_id) is None
+
+
+def test_eliminar_producto_en_promociones_sin_confirmar_falla_con_409(client, db_session, muzza):
+    from app.models.promotion import Promotion, PromotionProduct
+
+    promo = Promotion(name="Promo Dupla", price=15000, is_active=True)
+    promo.items = [PromotionProduct(product=muzza, quantity=2)]
+    db_session.add(promo)
+    db_session.commit()
+
+    # Consultar promociones del producto
+    res_promos = client.get(f"{PRODUCTS_URL}/{muzza.id}/promotions")
+    assert res_promos.status_code == 200
+    assert res_promos.json() == [{"id": promo.id, "name": "Promo Dupla"}]
+
+    # Intentar eliminar sin delete_promotions=True
+    res_delete = client.delete(f"{PRODUCTS_URL}/{muzza.id}")
+    assert res_delete.status_code == 409
+    assert "Promo Dupla" in res_delete.json()["detail"]
+
+    # El producto y la promo siguen existiendo
+    assert db_session.get(Product, muzza.id) is not None
+    assert db_session.get(Promotion, promo.id) is not None
+
+
+def test_eliminar_producto_en_promociones_con_confirmacion_elimina_todo_junto(client, db_session, muzza):
+    from app.models.promotion import Promotion, PromotionProduct
+
+    promo = Promotion(name="Promo Trío", price=20000, is_active=True)
+    promo.items = [PromotionProduct(product=muzza, quantity=3)]
+    db_session.add(promo)
+    db_session.commit()
+    promo_id = promo.id
+    prod_id = muzza.id
+
+    res_delete = client.delete(f"{PRODUCTS_URL}/{prod_id}?delete_promotions=true")
+    assert res_delete.status_code == 204
+
+    # Ambos eliminados
+    db_session.expire_all()
+    assert db_session.get(Product, prod_id) is None
+    assert db_session.get(Promotion, promo_id) is None
+
+
+def test_eliminar_producto_en_pedidos_en_curso_falla_con_400(client, db_session, muzza):
+    from app.models.order import Order, OrderItem, OrderStatus
+
+    order = Order(
+        customer_name="Juan Perez",
+        shipping_address="Calle Falsa 123",
+        status=OrderStatus.CONFIRMED.value,
+        total_amount=muzza.price,
+    )
+    order.items = [OrderItem(product=muzza, quantity=1, unit_price=muzza.price)]
+    db_session.add(order)
+    db_session.commit()
+
+    res = client.delete(f"{PRODUCTS_URL}/{muzza.id}")
+    assert res.status_code == 400
+    assert "pedidos en curso" in res.json()["detail"].lower()
+
+    # El producto sigue existiendo
+    assert db_session.get(Product, muzza.id) is not None
+
+
+def test_eliminar_producto_en_promocion_con_pedidos_en_curso_falla_con_400(client, db_session, muzza):
+    from app.models.order import Order, OrderItem, OrderStatus
+    from app.models.promotion import Promotion, PromotionProduct
+
+    promo = Promotion(name="Combo Activo", price=12000, is_active=True)
+    promo.items = [PromotionProduct(product=muzza, quantity=1)]
+    db_session.add(promo)
+    db_session.commit()
+
+    order = Order(
+        customer_name="Ana Lopez",
+        shipping_address="Av Siempre Viva 742",
+        status=OrderStatus.CONFIRMED.value,
+        total_amount=promo.price,
+    )
+    order.items = [OrderItem(promotion=promo, quantity=1, unit_price=promo.price)]
+    db_session.add(order)
+    db_session.commit()
+
+    res = client.delete(f"{PRODUCTS_URL}/{muzza.id}?delete_promotions=true")
+    assert res.status_code == 400
+    assert "pedidos en curso" in res.json()["detail"].lower()
+
+    # No se eliminó nada
+    assert db_session.get(Product, muzza.id) is not None
+    assert db_session.get(Promotion, promo.id) is not None
+
+
+def test_eliminar_producto_con_pedidos_historicos_lo_archiva_manteniendo_datos_historicos(client, db_session, muzza):
+    from app.models.menu import Ingredient, ProductIngredient
+    from app.models.order import Order, OrderItem, OrderStatus
+
+    ing = Ingredient(name="Queso Muzzarella Especial", unit="kg")
+    db_session.add(ing)
+    db_session.commit()
+
+    muzza.recipe_items.append(ProductIngredient(ingredient=ing, quantity=0.3))
+    muzza.replace_image(PNG, now=datetime.now(timezone.utc))
+    db_session.commit()
+
+    order = Order(
+        customer_name="Cliente Antiguo",
+        shipping_address="Retiro en el local",
+        status=OrderStatus.COMPLETED.value,
+        total_amount=muzza.price,
+    )
+    item = OrderItem(product=muzza, quantity=2, unit_price=muzza.price)
+    order.items = [item]
+    db_session.add(order)
+    db_session.commit()
+
+    prod_id = muzza.id
+    order_id = order.id
+
+    res = client.delete(f"{PRODUCTS_URL}/{prod_id}")
+    assert res.status_code == 204
+
+    db_session.expire_all()
+    archived = db_session.get(Product, prod_id)
+    assert archived is not None
+    assert archived.is_archived is True
+    assert archived.is_active is False
+    assert archived.category_id is None
+    # Imagen y receta eliminadas
+    assert archived.image is None
+    assert len(archived.recipe_items) == 0
+
+    # No aparece en menú público ni en admin
+    assert all(p["id"] != prod_id for p in client.get(MENU_URL).json())
+    assert all(p["id"] != prod_id for p in client.get(PRODUCTS_URL).json())
+
+    # Pero el pedido histórico sigue mostrando el nombre del producto correctamente
+    order_in_db = db_session.get(Order, order_id)
+    assert order_in_db.items[0].display_name == "Pizza Muzzarella"
+
+

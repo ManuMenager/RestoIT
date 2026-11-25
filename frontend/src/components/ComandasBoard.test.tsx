@@ -1,0 +1,615 @@
+import { act, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ComandasBoard } from '@/components/ComandasBoard';
+import * as orderService from '@/services/orderService';
+import { makeOrder, makeOrderDetail } from '@/test/utils';
+
+vi.mock('@/services/orderService');
+// El navegador de los tests no tiene audio: la alerta se prueba por separado.
+vi.mock('@/hooks/useNewOrderAlert', () => ({
+  useNewOrderAlert: () => ({
+    enabled: true,
+    toggleEnabled: vi.fn(),
+    unlockAudio: vi.fn(),
+    audioSupported: true,
+    audioBlocked: false,
+  }),
+}));
+
+const service = vi.mocked(orderService);
+
+function column(title: string) {
+  return screen.getByRole('heading', { name: title }).closest('div.rounded-2xl') as HTMLElement;
+}
+
+const ORDERS = [
+  makeOrder({ id: 1, customer_name: 'Nuevo Ahora', status: 'Confirmado', needs_attention: true }),
+  makeOrder({ id: 2, customer_name: 'Nuevo Programado', status: 'Confirmado', scheduled_for: '2026-10-04T00:30:00Z' }),
+  makeOrder({ id: 3, customer_name: 'Ya Confirmado', status: 'Confirmado', estimated_minutes: 20 }),
+  makeOrder({ id: 4, customer_name: 'Viajando', status: 'En Camino', trip_id: 9, trip_stop: 1, eta_minutes: 12 }),
+  makeOrder({ id: 5, customer_name: 'Para Retirar', status: 'Listo para Retirar', delivery_method: 'retiro' }),
+];
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  localStorage.clear();
+  service.fetchOrders.mockResolvedValue(ORDERS);
+  service.fetchOrderDetail.mockResolvedValue(makeOrderDetail());
+});
+
+describe('ComandasBoard', () => {
+  it('pide solo los pedidos activos y los reparte por columna', async () => {
+    render(<ComandasBoard />);
+
+    expect(await screen.findByText('Nuevo Ahora')).toBeInTheDocument();
+    expect(service.fetchOrders).toHaveBeenCalledWith({
+      status: ['Confirmado', 'En Camino', 'Listo para Retirar'],
+    });
+    expect(within(column('En preparación')).getByText('Ya Confirmado')).toBeInTheDocument();
+    expect(within(column('En Camino')).getByText('Viajando')).toBeInTheDocument();
+    expect(within(column('Listo para Retirar')).getByText('Para Retirar')).toBeInTheDocument();
+  });
+
+  it('sin pedidos activos, los refrescos periódicos no reemplazan el tablero por "Cargando" (parpadeo)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      service.fetchOrders.mockResolvedValue([]);
+      render(<ComandasBoard />);
+      await screen.findAllByText('Sin pedidos');
+      // El próximo refresco tarda en responder: mientras espera, el tablero sigue a la vista.
+      service.fetchOrders.mockReturnValue(new Promise(() => undefined));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10500);
+      });
+
+      expect(service.fetchOrders).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText('Cargando comandas...')).not.toBeInTheDocument();
+      expect(screen.getAllByText('Sin pedidos').length).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ya no hay una columna de pendientes: todos los pedidos entran en preparación', async () => {
+    render(<ComandasBoard />);
+    await screen.findByText('Nuevo Ahora');
+
+    expect(screen.queryByRole('heading', { name: 'Pendientes' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('heading', { level: 3 }).map((h) => h.textContent)).toEqual([
+      'En preparación',
+      'En Camino',
+      'Listo para Retirar',
+    ]);
+  });
+
+  it('separa los pedidos para ahora de los programados, pero el contador los incluye a todos', async () => {
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Nuevo Ahora');
+    const enPreparacion = column('En preparación');
+
+    expect(within(enPreparacion).getByText('3')).toBeInTheDocument();
+    expect(within(enPreparacion).queryByText('Nuevo Programado')).not.toBeInTheDocument();
+
+    await user.click(within(enPreparacion).getByRole('button', { name: 'Programados' }));
+
+    expect(within(enPreparacion).getByText('Nuevo Programado')).toBeInTheDocument();
+    expect(within(enPreparacion).queryByText('Nuevo Ahora')).not.toBeInTheDocument();
+  });
+
+  it('marcar un pedido En Camino lo mueve a esa columna sin pasar por aceptar ni rechazar', async () => {
+    service.updateOrderStatus.mockResolvedValue({ ...ORDERS[0], status: 'En Camino' });
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Nuevo Ahora');
+
+    await user.click(within(column('En preparación')).getAllByRole('button', { name: 'Marcar En Camino' })[0]);
+
+    expect(service.updateOrderStatus).toHaveBeenCalledWith(1, 'En Camino');
+    await waitFor(() => expect(within(column('En Camino')).getByText('Nuevo Ahora')).toBeInTheDocument());
+    expect(within(column('En preparación')).queryByText('Nuevo Ahora')).not.toBeInTheDocument();
+  });
+
+  it('un pedido nuevo se marca como visto desde su tarjeta', async () => {
+    service.markOrderSeen.mockResolvedValue({ ...ORDERS[0], needs_attention: false });
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Nuevo Ahora');
+
+    await user.click(within(column('En preparación')).getByRole('button', { name: 'Visto' }));
+
+    expect(service.markOrderSeen).toHaveBeenCalledWith(1);
+    await waitFor(() => expect(screen.queryByText('Pedido nuevo')).not.toBeInTheDocument());
+  });
+
+  it('abrir el detalle de un pedido nuevo lo marca como visto', async () => {
+    service.markOrderSeen.mockResolvedValue({ ...ORDERS[0], needs_attention: false });
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Nuevo Ahora');
+
+    await user.click(screen.getByText('Nuevo Ahora'));
+
+    expect(service.markOrderSeen).toHaveBeenCalledWith(1);
+  });
+
+  it('finalizar un pedido abonado lo saca del tablero', async () => {
+    service.fetchOrders.mockResolvedValue(ORDERS.map((o) => (o.id === 4 ? { ...o, is_paid: true } : o)));
+    service.updateOrderStatus.mockResolvedValue({ ...ORDERS[3], is_paid: true, status: 'Finalizado' });
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Viajando');
+
+    await user.click(within(column('En Camino')).getByRole('button', { name: 'Finalizar' }));
+
+    await waitFor(() => expect(screen.queryByText('Viajando')).not.toBeInTheDocument());
+  });
+
+  describe('viajes de los repartidores', () => {
+    const armando = (id: number, name: string, driverId: number | null, driverName: string | null) =>
+      makeOrder({
+        id,
+        customer_name: name,
+        status: 'En Camino',
+        delivery_method: 'domicilio',
+        delivery_driver_id: driverId,
+        delivery_driver_name: driverName,
+      });
+
+    it('agrupa por repartidor los pedidos que arman viaje y ofrece iniciarlo', async () => {
+      service.fetchOrders.mockResolvedValue([
+        armando(11, 'Ana', 1, 'Nico'),
+        armando(12, 'Beto', 1, 'Nico'),
+        armando(13, 'Caro', 2, 'Marcos'),
+        armando(14, 'Dani', null, null),
+      ]);
+      render(<ComandasBoard />);
+      await screen.findByText('Ana');
+
+      const viajes = within(screen.getByRole('region', { name: 'Viajes por armar' }));
+      expect(viajes.getByText('2 pedidos armando viaje')).toBeInTheDocument();
+      expect(viajes.getByText('1 pedido armando viaje')).toBeInTheDocument();
+      expect(viajes.getByText(/1 pedido sin repartidor/)).toBeInTheDocument();
+      expect(viajes.getByRole('button', { name: 'Iniciar viaje de Nico' })).toBeInTheDocument();
+      expect(viajes.getByRole('button', { name: 'Iniciar viaje de Marcos' })).toBeInTheDocument();
+    });
+
+    it('al iniciar el viaje se despachan los pedidos del repartidor y quedan con su llegada estimada', async () => {
+      service.fetchOrders.mockResolvedValue([armando(11, 'Ana', 1, 'Nico'), armando(12, 'Beto', 1, 'Nico')]);
+      service.dispatchTrip.mockResolvedValue({
+        id: 5,
+        delivery_driver_id: 1,
+        delivery_driver_name: 'Nico',
+        dispatched_at: '2026-11-06T20:00:00Z',
+        total_minutes: 22,
+        stops: [
+          { order_id: 12, stop: 1, address: 'Calle B 2', customer_name: 'Beto', eta_minutes: 9 },
+          { order_id: 11, stop: 2, address: 'Calle A 1', customer_name: 'Ana', eta_minutes: 22 },
+        ],
+      });
+      render(<ComandasBoard />);
+      const user = userEvent.setup();
+      await screen.findByText('Ana');
+
+      await user.click(screen.getByRole('button', { name: 'Iniciar viaje de Nico' }));
+
+      expect(service.dispatchTrip).toHaveBeenCalledWith(1);
+      expect(await screen.findByText('En viaje · llega en ~9 min')).toBeInTheDocument();
+      expect(screen.getByText('En viaje · llega en ~22 min')).toBeInTheDocument();
+      // Ya no queda nada por armar para Nico.
+      expect(screen.queryByRole('region', { name: 'Viajes por armar' })).not.toBeInTheDocument();
+    });
+
+    it('un pedido nuevo del mismo repartidor forma otro viaje, aparte del que ya salió', async () => {
+      service.fetchOrders.mockResolvedValue([
+        { ...armando(11, 'Ana', 1, 'Nico'), trip_id: 5, trip_stop: 1, eta_minutes: 10 },
+        armando(12, 'Beto', 1, 'Nico'),
+      ]);
+      render(<ComandasBoard />);
+      await screen.findByText('Ana');
+
+      const viajes = within(screen.getByRole('region', { name: 'Viajes por armar' }));
+      expect(viajes.getByText('1 pedido armando viaje')).toBeInTheDocument();
+    });
+
+    it('si no se pudo calcular la ruta el viaje sale igual, sin tiempo, y se avisa el motivo', async () => {
+      service.fetchOrders.mockResolvedValue([armando(11, 'Ana', 1, 'Nico')]);
+      service.dispatchTrip.mockResolvedValue({
+        id: 6,
+        delivery_driver_id: 1,
+        delivery_driver_name: 'Nico',
+        dispatched_at: '2026-11-06T20:00:00Z',
+        total_minutes: null,
+        warning: 'No se pudo consultar Google Maps.',
+        stops: [{ order_id: 11, stop: 1, address: 'Calle A 1', customer_name: 'Ana', eta_minutes: null }],
+      });
+      render(<ComandasBoard />);
+      const user = userEvent.setup();
+      await screen.findByText('Ana');
+
+      await user.click(screen.getByRole('button', { name: 'Iniciar viaje de Nico' }));
+
+      expect(await screen.findByText(/salió sin tiempo estimado. No se pudo consultar Google Maps/)).toBeInTheDocument();
+      expect(screen.getByText('En viaje')).toBeInTheDocument();
+      expect(screen.queryByRole('region', { name: 'Viajes por armar' })).not.toBeInTheDocument();
+    });
+
+    it('si el servidor rechaza iniciar el viaje muestra el motivo y los pedidos siguen armando viaje', async () => {
+      service.fetchOrders.mockResolvedValue([armando(11, 'Ana', 1, 'Nico')]);
+      service.dispatchTrip.mockRejectedValue({ message: 'Nico no tiene pedidos armando viaje.' });
+      render(<ComandasBoard />);
+      const user = userEvent.setup();
+      await screen.findByText('Ana');
+
+      await user.click(screen.getByRole('button', { name: 'Iniciar viaje de Nico' }));
+
+      expect(await screen.findByText(/no tiene pedidos armando viaje/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Iniciar viaje de Nico' })).toBeEnabled();
+    });
+  });
+
+  it('finalizar un pedido sin pagar pide confirmar el cobro y no lo finaliza si se cancela', async () => {
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Viajando');
+
+    await user.click(within(column('En Camino')).getByRole('button', { name: 'Finalizar' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'El pedido aún no está pago' });
+    expect(dialog).toHaveTextContent('Pedido #4');
+    expect(dialog).toHaveTextContent('17.000');
+    await user.click(within(dialog).getByRole('button', { name: 'Cancelar' }));
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(service.updateOrderPayment).not.toHaveBeenCalled();
+    expect(service.updateOrderStatus).not.toHaveBeenCalled();
+    expect(screen.getByText('Viajando')).toBeInTheDocument();
+  });
+
+  it('desde el aviso de pedido sin pagar lo marca como pago y lo finaliza', async () => {
+    service.updateOrderPayment.mockResolvedValue({ ...ORDERS[3], is_paid: true });
+    service.updateOrderStatus.mockResolvedValue({ ...ORDERS[3], is_paid: true, status: 'Finalizado' });
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Viajando');
+
+    await user.click(within(column('En Camino')).getByRole('button', { name: 'Finalizar' }));
+    await user.click(await screen.findByRole('button', { name: 'Marcar como pago y finalizar' }));
+
+    await waitFor(() => expect(screen.queryByText('Viajando')).not.toBeInTheDocument());
+    expect(service.updateOrderPayment).toHaveBeenCalledWith(4, true);
+    expect(service.updateOrderStatus).toHaveBeenCalledWith(4, 'Finalizado');
+    expect(service.updateOrderPayment.mock.invocationCallOrder[0]).toBeLessThan(
+      service.updateOrderStatus.mock.invocationCallOrder[0]
+    );
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('si no se puede registrar el cobro no finaliza el pedido', async () => {
+    service.updateOrderPayment.mockRejectedValue(new Error('caja cerrada'));
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Viajando');
+
+    await user.click(within(column('En Camino')).getByRole('button', { name: 'Finalizar' }));
+    await user.click(await screen.findByRole('button', { name: 'Marcar como pago y finalizar' }));
+
+    expect(await screen.findByText('No se pudo marcar el pedido como abonado. No se finalizó.')).toBeInTheDocument();
+    expect(service.updateOrderStatus).not.toHaveBeenCalled();
+    expect(screen.getByText('Viajando')).toBeInTheDocument();
+  });
+
+  it.each(['tarjeta', 'transferencia', 'efectivo'] as const)(
+    'al finalizar sin cobrar con %s aparece el aviso de pedido sin abonar',
+    async (method) => {
+      service.fetchOrders.mockResolvedValue([
+        makeOrder({
+          id: 40,
+          shift_number: 40,
+          customer_name: 'Cliente Pago',
+          status: 'Listo para Retirar',
+          delivery_method: 'retiro',
+          payment_method: method,
+          is_paid: false,
+          total_amount: 15000,
+        }),
+      ]);
+      render(<ComandasBoard />);
+      const user = userEvent.setup();
+      await screen.findByText('Cliente Pago');
+
+      await user.click(within(column('Listo para Retirar')).getByRole('button', { name: 'Finalizar' }));
+
+      const dialog = await screen.findByRole('dialog', { name: 'El pedido aún no está pago' });
+      expect(dialog).toBeInTheDocument();
+      expect(dialog).toHaveTextContent('Pedido #40');
+      expect(dialog).toHaveTextContent('15.000');
+    }
+  );
+
+  it('el despacho del pedido no se impide por estar sin abonar o sin comprobante', async () => {
+    service.fetchOrders.mockResolvedValue([
+      makeOrder({
+        id: 50,
+        customer_name: 'Sin Abonar En Viaje',
+        status: 'En Camino',
+        delivery_method: 'domicilio',
+        delivery_driver_id: 1,
+        delivery_driver_name: 'Nico',
+        payment_method: 'transferencia',
+        is_paid: false,
+        payment_proof: null,
+      }),
+    ]);
+    service.dispatchTrip.mockResolvedValue({
+      id: 10,
+      delivery_driver_id: 1,
+      delivery_driver_name: 'Nico',
+      dispatched_at: '2026-11-06T20:00:00Z',
+      total_minutes: 15,
+      stops: [
+        { order_id: 50, stop: 1, address: 'Calle 123', customer_name: 'Sin Abonar En Viaje', eta_minutes: 15 },
+      ],
+    });
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Sin Abonar En Viaje');
+
+    await user.click(screen.getByRole('button', { name: 'Iniciar viaje de Nico' }));
+
+    expect(service.dispatchTrip).toHaveBeenCalledWith(1);
+    expect(await screen.findByText('En viaje · llega en ~15 min')).toBeInTheDocument();
+  });
+
+  it('indica junto a Confirmados cuántos pedidos fueron modificados', async () => {
+    service.fetchOrders.mockResolvedValue([
+      ...ORDERS,
+      makeOrder({ id: 6, customer_name: 'Agregó una Coca', status: 'Confirmado', kitchen_update_pending: true }),
+    ]);
+    render(<ComandasBoard />);
+    await screen.findByText('Agregó una Coca');
+
+    expect(within(column('En preparación')).getByText('1 modificado')).toBeInTheDocument();
+  });
+
+  it('sin pedidos modificados no muestra el indicador', async () => {
+    render(<ComandasBoard />);
+    await screen.findByText('Ya Confirmado');
+
+    expect(within(column('En preparación')).queryByText(/modificado/)).not.toBeInTheDocument();
+  });
+
+  it('muestra el error si el cambio de estado falla y deja el pedido donde estaba', async () => {
+    service.updateOrderStatus.mockRejectedValue({ message: "No se puede pasar de 'Cancelado' a 'En Camino'." });
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Nuevo Ahora');
+
+    await user.click(within(column('En preparación')).getAllByRole('button', { name: 'Marcar En Camino' })[0]);
+
+    expect(await screen.findByText("No se puede pasar de 'Cancelado' a 'En Camino'.")).toBeInTheDocument();
+    expect(within(column('En preparación')).getByText('Nuevo Ahora')).toBeInTheDocument();
+  });
+
+  it('avisa si no se pudieron cargar las comandas', async () => {
+    service.fetchOrders.mockRejectedValue(new Error('caído'));
+    render(<ComandasBoard />);
+
+    expect(await screen.findByText('No se pudieron cargar las comandas.')).toBeInTheDocument();
+  });
+
+  it('pagina cada columna según la cantidad elegida', async () => {
+    const muchos = Array.from({ length: 7 }, (_, i) =>
+      makeOrder({ id: 100 + i, customer_name: `Cliente ${i}`, status: 'Confirmado', created_at: new Date(2026, 9, 3, 12, i).toISOString() })
+    );
+    service.fetchOrders.mockResolvedValue(muchos);
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Cliente 0');
+    const confirmados = column('En preparación');
+
+    expect(within(confirmados).getByText('1 de 2')).toBeInTheDocument();
+    expect(within(confirmados).queryByText('Cliente 5')).not.toBeInTheDocument();
+
+    await user.click(within(confirmados).getByRole('button', { name: 'Siguiente' }));
+    expect(within(confirmados).getByText('Cliente 5')).toBeInTheDocument();
+    expect(within(confirmados).queryByText('Cliente 0')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '7' }));
+    expect(within(confirmados).queryByText(/de 2/)).not.toBeInTheDocument();
+    expect(within(confirmados).getByText('Cliente 0')).toBeInTheDocument();
+  });
+
+  it('el botón Tomar pedido lleva a la carga de pedidos presenciales', async () => {
+    const onTakeOrder = vi.fn();
+    render(<ComandasBoard onTakeOrder={onTakeOrder} />);
+
+    await userEvent.setup().click(screen.getByRole('button', { name: /Tomar pedido/ }));
+
+    expect(onTakeOrder).toHaveBeenCalled();
+  });
+
+  it('abre el detalle del pedido al tocar una tarjeta', async () => {
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Ya Confirmado');
+
+    await user.click(screen.getByRole('button', { name: 'Ver detalle del pedido #3' }));
+
+    expect(await screen.findByRole('dialog', { name: 'Pedido #3' })).toBeInTheDocument();
+    expect(service.fetchOrderDetail).toHaveBeenCalledWith(3, expect.any(AbortSignal));
+  });
+
+  it('cancela un pedido desde su detalle: sale del tablero y la ventana se cierra', async () => {
+    service.updateOrderStatus.mockResolvedValue(makeOrder({ id: 3, status: 'Cancelado' }));
+    render(<ComandasBoard />);
+    const user = userEvent.setup();
+    await screen.findByText('Ya Confirmado');
+
+    await user.click(screen.getByRole('button', { name: 'Ver detalle del pedido #3' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Pedido #3' });
+    await user.click(within(dialog).getByRole('button', { name: 'Cancelar pedido' }));
+    await user.click(within(dialog).getByRole('button', { name: 'Sí, cancelar' }));
+
+    expect(service.updateOrderStatus).toHaveBeenCalledWith(3, 'Cancelado');
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(screen.queryByText('Ya Confirmado')).not.toBeInTheDocument();
+  });
+
+
+  describe('Separación de comandas por sector', () => {
+    const SECTOR_ORDERS = [
+      makeOrder({
+        id: 11,
+        customer_name: 'Solo Pizza',
+        status: 'Confirmado',
+        items: [
+          { id: 101, product_id: 1, product_name: 'Muzza', quantity: 2, unit_price: 8000, subtotal: 16000, sector: 'pizzeria', is_prepared: false },
+        ],
+        sectors: ['pizzeria'],
+      }),
+      makeOrder({
+        id: 12,
+        customer_name: 'Solo Tragos',
+        status: 'Confirmado',
+        items: [
+          { id: 102, product_id: 2, product_name: 'Fernet', quantity: 1, unit_price: 5000, subtotal: 5000, sector: 'barra', is_prepared: false },
+        ],
+        sectors: ['barra'],
+      }),
+      makeOrder({
+        id: 13,
+        customer_name: 'Pizza y Barra',
+        status: 'Confirmado',
+        items: [
+          { id: 103, product_id: 1, product_name: 'Fugazzeta', quantity: 1, unit_price: 9000, subtotal: 9000, sector: 'pizzeria', is_prepared: false },
+          { id: 104, product_id: 3, product_name: 'Cerveza', quantity: 2, unit_price: 3000, subtotal: 6000, sector: 'barra', is_prepared: false },
+        ],
+        sectors: ['pizzeria', 'barra'],
+      }),
+    ];
+
+    it('muestra las pestañas de sectores con sus respectivos contadores', async () => {
+      service.fetchOrders.mockResolvedValue(SECTOR_ORDERS);
+      render(<ComandasBoard />);
+
+      expect(await screen.findByText('Solo Pizza')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Todos/ })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Pizzería/ })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Barra/ })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Cocina/ })).toBeInTheDocument();
+    });
+
+    it('filtrar por un sector muestra únicamente los pedidos que tienen platos para ese sector', async () => {
+      service.fetchOrders.mockResolvedValue(SECTOR_ORDERS);
+      render(<ComandasBoard />);
+      const user = userEvent.setup();
+
+      expect(await screen.findByText('Solo Pizza')).toBeInTheDocument();
+      expect(screen.getByText('Solo Tragos')).toBeInTheDocument();
+      expect(screen.getByText('Pizza y Barra')).toBeInTheDocument();
+
+      // Filtrar por Pizzería
+      await user.click(screen.getByRole('button', { name: /Pizzería/ }));
+
+      expect(screen.getByText('Solo Pizza')).toBeInTheDocument();
+      expect(screen.getByText('Pizza y Barra')).toBeInTheDocument();
+      expect(screen.queryByText('Solo Tragos')).not.toBeInTheDocument();
+      expect(localStorage.getItem('resto_comandas_sector')).toBe('pizzeria');
+
+      // Filtrar por Barra
+      await user.click(screen.getByRole('button', { name: /Barra/ }));
+
+      expect(screen.getByText('Solo Tragos')).toBeInTheDocument();
+      expect(screen.getByText('Pizza y Barra')).toBeInTheDocument();
+      expect(screen.queryByText('Solo Pizza')).not.toBeInTheDocument();
+      expect(localStorage.getItem('resto_comandas_sector')).toBe('barra');
+
+      // Volver a Todos
+      await user.click(screen.getByRole('button', { name: /Todos/ }));
+      expect(screen.getByText('Solo Pizza')).toBeInTheDocument();
+      expect(screen.getByText('Solo Tragos')).toBeInTheDocument();
+    });
+
+    it('las tarjetas en el tablero no muestran platos ni checks para mantener legibilidad', async () => {
+      service.fetchOrders.mockResolvedValue([SECTOR_ORDERS[0]]);
+      render(<ComandasBoard />);
+
+      expect(await screen.findByText('Solo Pizza')).toBeInTheDocument();
+      expect(screen.queryByText('Muzza')).not.toBeInTheDocument();
+      expect(screen.queryByText('2×')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Marcar listo' })).not.toBeInTheDocument();
+      expect(screen.queryByText('✓ Listo')).not.toBeInTheDocument();
+      expect(screen.queryByText(/Progreso general/)).not.toBeInTheDocument();
+    });
+  });
+
+
+
+  describe('buscador', () => {
+    const SEARCHABLE = [
+      makeOrder({ id: 11, shift_number: 66, customer_name: 'Emanuel', status: 'Confirmado', shipping_address: 'Rodolfo Lopez 55', customer_phone: '1162939338' }),
+      makeOrder({ id: 12, shift_number: 7, customer_name: 'Fede', status: 'Confirmado', estimated_minutes: 20, shipping_address: 'Belgrano 95', customer_phone: '1144445555' }),
+      makeOrder({ id: 13, shift_number: 8, customer_name: 'Laura', status: 'En Camino', shipping_address: 'Mitre 10', customer_phone: '1100000000' }),
+    ];
+
+    it('filtra las tarjetas dejando cada una en la columna de su estado', async () => {
+      service.fetchOrders.mockResolvedValue(SEARCHABLE);
+      const user = userEvent.setup();
+      render(<ComandasBoard />);
+      await screen.findByText('Emanuel');
+
+      await user.type(screen.getByRole('textbox', { name: 'Buscar comandas' }), 'fede');
+
+      await waitFor(() => expect(screen.queryByText('Emanuel')).not.toBeInTheDocument());
+      expect(within(column('En preparación')).getByText('Fede')).toBeInTheDocument();
+      expect(screen.queryByText('Laura')).not.toBeInTheDocument();
+      // Las tres columnas siguen ahí.
+      expect(screen.getByRole('heading', { name: 'En Camino' })).toBeInTheDocument();
+    });
+
+    it('encuentra por número de pedido, dirección y teléfono', async () => {
+      service.fetchOrders.mockResolvedValue(SEARCHABLE);
+      const user = userEvent.setup();
+      render(<ComandasBoard />);
+      await screen.findByText('Emanuel');
+      const input = screen.getByRole('textbox', { name: 'Buscar comandas' });
+
+      await user.type(input, '#66');
+      await waitFor(() => expect(screen.queryByText('Fede')).not.toBeInTheDocument());
+      expect(screen.getByText('Emanuel')).toBeInTheDocument();
+
+      await user.clear(input);
+      await user.type(input, 'belgrano');
+      await waitFor(() => expect(screen.queryByText('Emanuel')).not.toBeInTheDocument());
+      expect(screen.getByText('Fede')).toBeInTheDocument();
+
+      await user.clear(input);
+      await user.type(input, '1100000000');
+      await waitFor(() => expect(screen.queryByText('Fede')).not.toBeInTheDocument());
+      expect(screen.getByText('Laura')).toBeInTheDocument();
+    });
+
+    it('avisa cuando nada coincide y se limpia con la X o con Esc', async () => {
+      service.fetchOrders.mockResolvedValue(SEARCHABLE);
+      const user = userEvent.setup();
+      render(<ComandasBoard />);
+      await screen.findByText('Emanuel');
+      const input = screen.getByRole('textbox', { name: 'Buscar comandas' });
+
+      await user.type(input, 'zzz');
+      expect(await screen.findByText("No se encontraron comandas para 'zzz'.")).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Borrar búsqueda' }));
+      expect(await screen.findByText('Emanuel')).toBeInTheDocument();
+      expect(input).toHaveValue('');
+
+      await user.type(input, 'zzz');
+      await screen.findByText("No se encontraron comandas para 'zzz'.");
+      await user.keyboard('{Escape}');
+      expect(await screen.findByText('Emanuel')).toBeInTheDocument();
+    });
+  });
+});

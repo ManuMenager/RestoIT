@@ -1,0 +1,45 @@
+from datetime import datetime, timedelta, timezone
+
+import bcrypt
+from jose import jwt
+
+from app.core.config import settings
+from app.models.user import ROLE_ADMIN
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+
+
+def create_access_token(subject: str, role: str, expires_delta: timedelta | None = None) -> str:
+    if expires_delta is None:
+        minutes = (
+            settings.ADMIN_ACCESS_TOKEN_EXPIRE_MINUTES if role == ROLE_ADMIN else settings.ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+        expires_delta = timedelta(minutes=minutes)
+    expire = datetime.now(timezone.utc) + expires_delta
+    to_encode = {"sub": subject, "role": role, "exp": expire}
+    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_access_token(token: str) -> dict:
+    """Decodifica el JWT. Lanza jose.JWTError (incluye expiración) si es inválido."""
+    return jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+
+
+def create_privileged_token(subject: str, scope: str, expires_delta: timedelta | None = None) -> str:
+    """Token de corta duración (5 minutos) para sesiones privilegiadas (PIN de admin o caja)."""
+    if expires_delta is None:
+        expires_delta = timedelta(minutes=5)
+    expire = datetime.now(timezone.utc) + expires_delta
+    to_encode = {"sub": subject, "scope": scope, "exp": expire}
+    return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_privileged_token(token: str) -> dict:
+    """Decodifica el JWT de sesión privilegiada. Lanza jose.JWTError si es inválido o expiró."""
+    return jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
