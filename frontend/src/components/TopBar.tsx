@@ -77,7 +77,10 @@ export function TopBar({
       )}
 
       {actions && (
-        <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-2">{actions}</div>
+        // En pantallas angostas las acciones van en una fila propia bajo el nombre (si no, lo pisan); desde md, a la derecha.
+        <div className="mt-3 flex items-center justify-center gap-2 px-4 md:mt-0 md:px-0 md:absolute md:right-4 md:top-1/2 md:-translate-y-1/2">
+          {actions}
+        </div>
       )}
     </header>
   );
